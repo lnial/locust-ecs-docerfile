@@ -1,0 +1,14 @@
+#!/bin/bash
+
+echo "${LOCUST_MODE}"
+
+if [ "master" != "${LOCUST_MODE}" ]; then
+    echo "=== Confirm to connect master ===="
+    ping -c 3 ${LOCUST_MASTER}
+    echo "=== Start LOCUST as slave mode ==="
+    locust -f /locust_src/locustfile.py --worker --master-host ${LOCUST_MASTER}
+else 
+
+    echo "=== Start LOCUST as master mode ==="
+    locust -f /locust_src/locustfile.py --master -H http://hogehoge.com
+fi
