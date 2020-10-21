@@ -5,10 +5,10 @@ RUN pip install locust
 RUN mkdir /locust
 RUN mkdir /locust_src
 
-ADD ./master /locust/master
+ADD ./master /locust/mode
 ADD ./locustfile.py /locust_src/locustfile.py
 
-RUN chmod +x /locust/master
+RUN chmod +x /locust/mode
 RUN chmod +x /locust_src/locustfile.py
 
-CMD ["/locust/master"]
+CMD ["/locust/mode"]
