@@ -1,0 +1,613 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Locust on ECS
+Parameters:
+
+  WorkerCount:
+    Type: Number
+    Default: 5
+    Description: Worker Count
+    ConstraintDescription: Worker Count
+
+Resources:
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      InstanceTenancy: default
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: SolutionId
+          Value: SO9999
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W60
+            reason: This VPC is used by Fargates only, so it does not require to have VPC flow logs.
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone:
+        !Select
+        - 0
+        - !GetAZs
+      VpcId: !Ref Vpc
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone:
+        !Select
+        - 1
+        - !GetAZs
+      VpcId: !Ref Vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties: {}
+
+  MainRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteToInternet:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref MainRouteTable
+      GatewayId: !Ref InternetGateway
+
+  RouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref MainRouteTable
+      SubnetId: !Ref PublicSubnetA
+
+  RouteTableAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref MainRouteTable
+      SubnetId: !Ref PublicSubnetB
+
+  EcsLBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS LB SG
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 80
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS SG
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  EcsWorkerSecurityGroupIgress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5557
+      ToPort: 5558
+      SourceSecurityGroupId: !GetAtt EcsSecurityGroup.GroupId
+
+  EcsMasterSecurityGroupIgress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8089
+      ToPort: 8089
+      SourceSecurityGroupId: !GetAtt EcsSecurityGroup.GroupId
+
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  EcrRepository:
+    DeletionPolicy: Retain
+    Type: AWS::ECR::Repository
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}
+      ClusterSettings:
+        -
+          Name: containerInsights
+          Value: disabled
+      Tags:
+        - Key: SolutionId
+          Value: SO9999
+
+  EcsCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 365
+
+  EcsTaskDefinitionMaster:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: 512
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      Memory: 1024
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        -
+          Essential: true
+          Name: !Sub ${AWS::StackName}-master
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:latest
+          Memory: 1024
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref EcsCloudWatchLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: master
+          PortMappings:
+            - ContainerPort: 8089
+              HostPort: 8089
+              Protocol: tcp
+            - ContainerPort: 5557
+              HostPort: 5557
+              Protocol: tcp
+            - ContainerPort: 5558
+              HostPort: 5558
+              Protocol: tcp
+          Environment:
+            - Name: LOCUST_MODE
+              Value: master
+
+  EcsServiceDiscoveryNamespaceMaster:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub ${AWS::StackName}.local
+      Vpc: !Ref Vpc
+
+  EcsServiceRegistry:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Description: Master DNS
+      DnsConfig:
+        NamespaceId: !Ref EcsServiceDiscoveryNamespaceMaster
+        DnsRecords:
+          - Type: A
+            TTL: 60
+        RoutingPolicy: WEIGHTED
+      Name: master
+
+  EcsServiceMaster:
+    Type: AWS::ECS::Service
+    DependsOn: [ EcsTaskDefinitionMaster ]
+    Properties:
+      ServiceName: !Sub ${AWS::StackName}-master
+      Cluster: !Ref EcsCluster
+      SchedulingStrategy: REPLICA
+      TaskDefinition: !Ref EcsTaskDefinitionMaster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      ServiceRegistries:
+        - RegistryArn: !GetAtt EcsServiceRegistry.Arn
+      NetworkConfiguration:
+        AwsVpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+      LoadBalancers:
+        - TargetGroupArn: !Ref EcsLoadBalancerTargetGroup
+          ContainerPort: 8089
+          ContainerName: !Sub ${AWS::StackName}-master
+
+  EcsTaskDefinitionWorker:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: [ EcsServiceMaster ]
+    Properties:
+      Cpu: 512
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      Memory: 1024
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        -
+          Essential: true
+          Name: !Sub ${AWS::StackName}-worker
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:latest
+          Memory: 1024
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref EcsCloudWatchLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+          PortMappings:
+            - ContainerPort: 5557
+              HostPort: 5557
+              Protocol: tcp
+            - ContainerPort: 5558
+              HostPort: 5558
+              Protocol: tcp
+          Environment:
+            - Name: LOCUST_MODE
+              Value: worker
+            - Name: LOCUST_MASTER
+              Value: !Sub master.${AWS::StackName}.local
+
+  EcsServiceWorker:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${AWS::StackName}-worker
+      Cluster: !Ref EcsCluster
+      SchedulingStrategy: REPLICA
+      TaskDefinition: !Ref EcsTaskDefinitionWorker
+      DesiredCount: !Ref WorkerCount
+      LaunchType: FARGATE
+      ServiceRegistries:
+        - RegistryArn: !GetAtt EcsServiceRegistry.Arn
+      NetworkConfiguration:
+        AwsVpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+
+  EcsLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref EcsLBSecurityGroup
+        - !Ref EcsSecurityGroup
+
+  EcsLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref EcsLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref EcsLoadBalancerTargetGroup
+
+  EcsLoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: EcsLoadBalancer
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 8089
+      Protocol: HTTP
+      Matcher:
+        HttpCode: 200-299
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      TargetType: ip
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+
+  ContainerS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  CustomLambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub ${ContainerS3Bucket.Arn}
+                  - !Sub ${ContainerS3Bucket.Arn}/*
+
+  CustomResourceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CustomLambdaIAMRole.Arn
+      Runtime: python3.7
+      Timeout: 50
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.request
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              bucket_name = event['ResourceProperties']['SrcBucket']
+              url = "https://github.com/lnial/locust-ecs-dockerfile/releases/download/1.2/release.zip"
+              save_name = "/tmp/release.zip"
+
+              # ダウンロードを実行
+              urllib.request.urlretrieve(url, save_name)
+
+              s3 = boto3.resource("s3")
+              bucket = s3.Bucket(bucket_name)
+              bucket.upload_file(save_name, "release.zip")
+
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+
+  LambdaTrigger:
+    Type: Custom::LambdaTrigger
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      SrcBucket: !Ref ContainerS3Bucket
+
+  CloudWatchLogsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-cloudwatch-policy
+      Roles:
+        - !Ref EcsTaskExecutionRole
+        - !Ref ContainerCodeBuildRole
+        - !Ref ContainerCodePipelineRole
+        - !Ref CustomLambdaIAMRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/*
+
+  ContainerCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: codebuild.amazonaws.com
+      Policies:
+        -
+          PolicyName: !Sub ${AWS::StackName}-code-build-policy
+          PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - ecr:DescribeImages
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:ListImages
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetRepositoryPolicy
+                Resource:
+                  - !Sub ${EcrRepository.Arn}
+              -
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              -
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:GetObjectVersion
+                  - s3:ListBucketVersions
+                  - s3:PutObject
+                Resource:
+                  - !Sub ${ContainerS3Bucket.Arn}
+                  - !Sub ${ContainerS3Bucket.Arn}/*
+
+  ContainerCodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        -
+          PolicyName: !Sub ${AWS::StackName}-code-pipeline-policy
+          PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:ListBucketVersions
+                  - s3:PutObject
+                Resource:
+                  - arn:aws:s3:::*
+                  - !Sub ${ContainerS3Bucket.Arn}
+                  - !Sub ${ContainerS3Bucket.Arn}/*
+              -
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource:
+                  - !Sub ${ContainerCodeBuild.Arn}
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn: [ CloudWatchLogsPolicy, LambdaTrigger]
+    Properties:
+      Name: !Sub ${AWS::StackName}-code-pipeline
+      RoleArn: !GetAtt ContainerCodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ContainerS3Bucket
+      Stages:
+        -
+          Name: Source
+          Actions:
+            -
+              Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref ContainerS3Bucket
+                S3ObjectKey: release.zip
+              OutputArtifacts:
+                - Name: SourceOutput
+        -
+          Name: Build
+          Actions:
+            -
+              Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Ref ContainerCodeBuild
+
+  ContainerCodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Description: ContainerCodeBuild-ShhFyMj8MrSV
+      TimeoutInMinutes: 60
+      ServiceRole: !GetAtt ContainerCodeBuildRole.Arn
+      EncryptionKey: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:4.0
+        PrivilegedMode: True
+        EnvironmentVariables:
+          -
+            Name: REPOSITORY
+            Value: !Sub ${EcrRepository}
+          -
+            Name: REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+              pre_build:
+                commands:
+                  - echo $REPOSITORY
+                  - echo $REPOSITORY_URI
+                  - $(aws ecr get-login --region ${AWS::Region} --no-include-email)
+              build:
+                commands:
+                  - docker build -t $REPOSITORY:latest .
+                  - docker tag $REPOSITORY:latest $REPOSITORY_URI:latest
+              post_build:
+                commands:
+                  - docker push $REPOSITORY_URI:latest
+Outputs:
+  Console:
+    Description: Locust URL
+    Value: !Sub http://${EcsLoadBalancer.DNSName}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
