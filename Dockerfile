@@ -1,4 +1,4 @@
-FROM python:3.6
+FROM public.ecr.aws/v0b5s6b3/python:3.6
 
 RUN pip install locust
 
